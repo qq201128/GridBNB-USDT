@@ -12,7 +12,7 @@ from helpers import send_pushplus_message, format_trade_message
 import json
 import os
 from monitor import TradingMonitor
-from position_controller_s1 import PositionControllerS1
+from position_controller_futures import PositionControllerFutures
 
 
 class GridTrader:
@@ -81,7 +81,11 @@ class GridTrader:
             'data': {}
         }
         self.funding_cache_ttl = 60  # 理财余额缓存60秒
-        self.position_controller_s1 = PositionControllerS1(self)
+        self.position_controller_futures = PositionControllerFutures(self)
+        
+        # 合约特有参数
+        self.leverage = 10  # 默认杠杆倍数
+        self.margin_mode = 'isolated'  # 保证金模式
 
         # 独立的监测状态变量，避免买入和卖出监测相互干扰
         self.is_monitoring_buy = False   # 是否在监测买入机会
@@ -234,8 +238,8 @@ class GridTrader:
                         raise
                     await asyncio.sleep(2)
 
-            # 检查现货账户资金并划转
-            await self._check_and_transfer_initial_funds()
+            # 设置合约参数
+            await self._setup_futures_parameters()
 
             self.symbol_info = self.exchange.exchange.market(self.symbol)
 
@@ -510,7 +514,7 @@ class GridTrader:
             return getattr(self, cache_key, 0)  # 如果缓存存在则返回缓存，否则返回0
 
     async def get_available_balance(self, currency):
-        balance = await self.exchange.fetch_balance({'type': 'spot'})
+        balance = await self.exchange.fetch_balance()  # 合约账户余额
         return balance.get('free', {}).get(currency, 0) * settings.SAFETY_MARGIN
 
     async def _calculate_dynamic_interval_seconds(self):
@@ -569,9 +573,9 @@ class GridTrader:
                     continue
                 self.current_price = current_price
 
-                # ========== 新增：获取本轮循环的统一账户快照 ==========
-                spot_balance = await self.exchange.fetch_balance()
-                funding_balance = await self.exchange.fetch_funding_balance()
+                # ========== 获取本轮循环的统一账户快照 - 合约版本 ==========
+                futures_balance = await self.exchange.fetch_balance()
+                funding_balance = {}  # 合约交易不需要理财余额
                 # ========== 新增结束 ==========
 
                 # --- 核心理念：维护任务与交易任务分离 ---
@@ -580,8 +584,8 @@ class GridTrader:
                 # 阶段二：周期性维护模块 (始终运行，保证机器人认知更新)
                 # ------------------------------------------------------------------
 
-                # 1. 更新S1策略的每日高低点
-                await self.position_controller_s1.update_daily_s1_levels()
+                # 1. 更新合约策略的每日高低点
+                await self.position_controller_futures.update_daily_s1_levels()
 
                 # 2. 检查是否需要调整网格大小 (包含波动率计算)
                 # 这个任务现在独立运行，不再被交易状态阻塞
@@ -598,7 +602,7 @@ class GridTrader:
                 # ------------------------------------------------------------------
 
                 # 1. 【核心】首先获取唯一的风控许可
-                risk_state = await self.risk_manager.check_position_limits(spot_balance, funding_balance)
+                risk_state = await self.risk_manager.check_position_limits(futures_balance, funding_balance)
 
                 # 2. 定义标志位，确保一轮循环只做一次主网格交易
                 trade_executed_this_loop = False
@@ -619,10 +623,10 @@ class GridTrader:
                         if await self.execute_order('buy'):
                             trade_executed_this_loop = True
 
-                # 5. S1辅助策略：它也是一种交易，但独立于主网格
-                # 只有在本轮没有发生主网格交易时才考虑执行S1，避免冲突
+                # 5. 合约辅助策略：它也是一种交易，但独立于主网格
+                # 只有在本轮没有发生主网格交易时才考虑执行合约策略，避免冲突
                 if not trade_executed_this_loop:
-                    await self.position_controller_s1.check_and_execute(risk_state)
+                    await self.position_controller_futures.check_and_execute(risk_state)
 
                 # --- 逻辑执行完毕 ---
 
@@ -794,7 +798,7 @@ class GridTrader:
         return order_dict
 
     async def execute_order(self, side):
-        """执行订单，带重试机制"""
+        """执行合约订单，带重试机制"""
         max_retries = 10  # 最大重试次数
         retry_count = 0
         check_interval = 3  # 下单后等待检查时间（秒）
@@ -815,19 +819,18 @@ class GridTrader:
                 else:
                     order_price = order_book['bids'][0][0]  # 买1价卖出
 
-                # 计算交易数量
+                # 计算交易数量 - 合约版本
                 amount_quote = await self._calculate_order_amount(side)
                 amount = self._adjust_amount_precision(amount_quote / order_price)
 
                 # 调整价格精度
                 order_price = self._adjust_price_precision(order_price)
 
-                # 检查余额是否足够 - 需要获取最新的余额信息
-                spot_balance = await self.exchange.fetch_balance({'type': 'spot'})
-                funding_balance = await self.exchange.fetch_funding_balance()
+                # 检查合约账户余额是否足够
+                futures_balance = await self.exchange.fetch_balance()
 
-                if not await self._ensure_balance_for_trade(side, spot_balance, funding_balance):
-                    self.logger.warning(f"{side}余额不足，第 {retry_count + 1} 次尝试中止")
+                if not await self._ensure_balance_for_futures_trade(side, futures_balance):
+                    self.logger.warning(f"{side}合约余额不足，第 {retry_count + 1} 次尝试中止")
                     return False
 
                 # 为了日志记录，将字符串类型的 amount 临时转为浮点数
@@ -839,13 +842,13 @@ class GridTrader:
                     f"数量: {log_display_amount:.8f} {self.base_asset}"
                 )
 
-                # 创建订单
-                order = await self.exchange.create_order(
-                    self.symbol,
-                    'limit',
-                    side,
-                    amount,
-                    order_price
+                # 创建合约订单
+                order = await self.exchange.create_futures_order(
+                    symbol=self.symbol,
+                    side=side,
+                    amount=amount,
+                    price=order_price,
+                    order_type='limit'
                 )
 
                 # 更新活跃订单状态
@@ -1620,8 +1623,25 @@ class GridTrader:
             )
         )
 
+    async def _setup_futures_parameters(self):
+        """设置合约交易参数"""
+        try:
+            self.logger.info(f"正在设置合约参数: 杠杆={self.leverage}x, 保证金模式={self.margin_mode}")
+            
+            # 设置杠杆倍数
+            await self.exchange.set_leverage(self.symbol, self.leverage)
+            
+            # 设置保证金模式
+            await self.exchange.set_margin_mode(self.symbol, self.margin_mode)
+            
+            self.logger.info("合约参数设置完成")
+            
+        except Exception as e:
+            self.logger.error(f"设置合约参数失败: {str(e)}")
+            # 不抛出异常，允许程序继续运行
+            
     async def _check_and_transfer_initial_funds(self):
-        """检查并划转初始资金"""
+        """检查并划转初始资金 - 合约版本已禁用"""
         # 功能开关检查
         if not settings.ENABLE_SAVINGS_FUNCTION:
             self.logger.info("理财功能已禁用，跳过初始资金检查与划转。")
@@ -1731,12 +1751,9 @@ class GridTrader:
 
     async def _get_pair_specific_assets_value(self):
         """
-        获取当前交易对相关资产价值（以计价货币计算）- 用于交易决策
-
-        此方法仅计算当前交易对（self.base_asset和self.quote_asset）的资产价值，
-        用于该交易对的交易决策和风险控制，实现交易对之间的风险隔离。
-
-        如需获取全账户总资产（用于报告），请使用 exchange.calculate_total_account_value() 方法。
+        获取当前交易对相关资产价值（以计价货币计算）- 合约版本
+        
+        合约交易中，主要关注USDT保证金余额和当前仓位价值
         """
         try:
             # 使用缓存避免频繁请求
@@ -1748,8 +1765,8 @@ class GridTrader:
             # 设置一个默认返回值，以防发生异常
             default_total = self._assets_cache['value'] if hasattr(self, '_assets_cache') else 0
 
+            # 获取合约账户余额
             balance = await self.exchange.fetch_balance()
-            funding_balance = await self.exchange.fetch_funding_balance()
             current_price = await self._get_latest_price()
 
             # 防御性检查：确保返回的价格是有效的
@@ -1762,25 +1779,23 @@ class GridTrader:
                 self.logger.error("获取余额失败，返回默认总资产")
                 return default_total
 
-            # 分别获取现货和理财账户余额（使用动态资产名称）
-            spot_base = float(balance.get('free', {}).get(self.base_asset, 0) or 0)
-            spot_quote = float(balance.get('free', {}).get(self.quote_asset, 0) or 0)
+            # 获取USDT余额（合约保证金）
+            usdt_balance = float(balance.get('free', {}).get('USDT', 0) or 0)
+            usdt_used = float(balance.get('used', {}).get('USDT', 0) or 0)
+            
+            # 获取当前仓位信息
+            positions = await self.exchange.fetch_positions([self.symbol])
+            position_value = 0
+            unrealized_pnl = 0
+            
+            for position in positions:
+                if position['symbol'] == self.symbol:
+                    position_value = float(position.get('notional', 0))
+                    unrealized_pnl = float(position.get('unrealizedPnl', 0))
+                    break
 
-            # 加上已冻结的余额
-            spot_base += float(balance.get('used', {}).get(self.base_asset, 0) or 0)
-            spot_quote += float(balance.get('used', {}).get(self.quote_asset, 0) or 0)
-
-            # 加上理财账户余额
-            fund_base = 0
-            fund_quote = 0
-            if funding_balance:
-                fund_base = float(funding_balance.get(self.base_asset, 0) or 0)
-                fund_quote = float(funding_balance.get(self.quote_asset, 0) or 0)
-
-            # 分别计算现货和理财账户总值
-            spot_value = spot_quote + (spot_base * current_price)
-            fund_value = fund_quote + (fund_base * current_price)
-            total_assets = spot_value + fund_value
+            # 计算总资产：可用余额 + 已用余额 + 未实现盈亏
+            total_assets = usdt_balance + usdt_used + unrealized_pnl
 
             # 更新缓存
             self._assets_cache = {
@@ -1792,18 +1807,18 @@ class GridTrader:
             if not hasattr(self, '_last_logged_assets') or \
                     abs(total_assets - self._last_logged_assets) / max(self._last_logged_assets, 0.01) > 0.01:
                 self.logger.info(
-                    f"【{self.symbol}】交易对资产: {total_assets:.2f} {self.quote_asset} | "
-                    f"现货: {spot_value:.2f} {self.quote_asset} "
-                    f"({self.base_asset}: {spot_base:.4f}, {self.quote_asset}: {spot_quote:.2f}) | "
-                    f"理财: {fund_value:.2f} {self.quote_asset} "
-                    f"({self.base_asset}: {fund_base:.4f}, {self.quote_asset}: {fund_quote:.2f})"
+                    f"【{self.symbol}】合约账户资产: {total_assets:.2f} USDT | "
+                    f"可用余额: {usdt_balance:.2f} USDT | "
+                    f"已用保证金: {usdt_used:.2f} USDT | "
+                    f"仓位价值: {position_value:.2f} USDT | "
+                    f"未实现盈亏: {unrealized_pnl:+.2f} USDT"
                 )
                 self._last_logged_assets = total_assets
 
             return total_assets
 
         except Exception as e:
-            self.logger.error(f"计算总资产失败: {str(e)}")
+            self.logger.error(f"计算合约总资产失败: {str(e)}")
             return self._assets_cache['value'] if hasattr(self, '_assets_cache') else 0
 
     async def _update_total_assets(self):
@@ -2002,6 +2017,81 @@ class GridTrader:
         except Exception as e:
             self.logger.error(f"检查 {side} 余额失败: {e}", exc_info=True)
             send_pushplus_message(f"余额检查错误 ({side}): {e}", "系统错误")
+            return False
+
+    async def _ensure_balance_for_futures_trade(self, side: str, futures_balance: dict) -> bool:
+        """
+        检查合约账户余额是否足够进行交易
+        """
+        try:
+            # 获取USDT余额（合约保证金）
+            usdt_balance = float(futures_balance.get('free', {}).get('USDT', 0) or 0)
+            
+            # 计算所需保证金
+            amount_quote = await self._calculate_order_amount(side)
+            required_margin = amount_quote / self.leverage  # 考虑杠杆
+            
+            self.logger.info(f"合约{side}前余额检查 | 所需保证金: {required_margin:.4f} USDT | 可用余额: {usdt_balance:.4f} USDT")
+            
+            # 检查余额是否足够（保留10%缓冲）
+            if usdt_balance >= required_margin * 1.1:
+                return True
+            else:
+                self.logger.error(f"合约保证金不足 | 所需: {required_margin:.4f} USDT | 可用: {usdt_balance:.4f} USDT")
+                return False
+                
+        except Exception as e:
+            self.logger.error(f"检查合约{side}余额失败: {e}", exc_info=True)
+            return False
+
+    async def _ensure_balance_for_futures_trade(self, side: str, futures_balance: dict) -> bool:
+        """
+        检查合约账户余额是否足够进行交易
+        """
+        try:
+            # 获取USDT余额（合约保证金）
+            usdt_balance = float(futures_balance.get('free', {}).get('USDT', 0) or 0)
+            
+            # 计算所需保证金
+            amount_quote = await self._calculate_order_amount(side)
+            required_margin = amount_quote / self.leverage  # 考虑杠杆
+            
+            self.logger.info(f"合约{side}前余额检查 | 所需保证金: {required_margin:.4f} USDT | 可用余额: {usdt_balance:.4f} USDT")
+            
+            # 检查余额是否足够（保留10%缓冲）
+            if usdt_balance >= required_margin * 1.1:
+                return True
+            else:
+                self.logger.error(f"合约保证金不足 | 所需: {required_margin:.4f} USDT | 可用: {usdt_balance:.4f} USDT")
+                return False
+                
+        except Exception as e:
+            self.logger.error(f"检查合约{side}余额失败: {e}", exc_info=True)
+            return False
+
+    async def _ensure_balance_for_futures_trade(self, side: str, futures_balance: dict) -> bool:
+        """
+        检查合约账户余额是否足够进行交易
+        """
+        try:
+            # 获取USDT余额（合约保证金）
+            usdt_balance = float(futures_balance.get('free', {}).get('USDT', 0) or 0)
+            
+            # 计算所需保证金
+            amount_quote = await self._calculate_order_amount(side)
+            required_margin = amount_quote / self.leverage  # 考虑杠杆
+            
+            self.logger.info(f"合约{side}前余额检查 | 所需保证金: {required_margin:.4f} USDT | 可用余额: {usdt_balance:.4f} USDT")
+            
+            # 检查余额是否足够（保留10%缓冲）
+            if usdt_balance >= required_margin * 1.1:
+                return True
+            else:
+                self.logger.error(f"合约保证金不足 | 所需: {required_margin:.4f} USDT | 可用: {usdt_balance:.4f} USDT")
+                return False
+                
+        except Exception as e:
+            self.logger.error(f"检查合约余额失败: {e}", exc_info=True)
             return False
 
 

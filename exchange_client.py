@@ -11,22 +11,23 @@ class ExchangeClient:
         self.logger = logging.getLogger(self.__class__.__name__)
         # API密钥验证已由Pydantic在settings实例化时自动完成
         
-        # 获取代理配置，如果环境变量中没有设置，则使用None
-        proxy = os.getenv('HTTP_PROXY')
+        # 获取代理配置
+        proxy = os.getenv('HTTP_PROXY', 'http://127.0.0.1:10809')  # 使用你提供的代理地址
         
-        # 先初始化交易所实例
+        # 先初始化交易所实例 - 合约模式
         self.exchange = ccxt.binance({
             'apiKey': settings.BINANCE_API_KEY,
             'secret': settings.BINANCE_API_SECRET,
             'enableRateLimit': True,
-            'timeout': 60000,  # 增加超时时间到60秒
+            'timeout': 30000,  # 减少超时时间到30秒
+            'sandbox': False,  # 确保不是测试环境
             'options': {
-                'defaultType': 'spot',
+                'defaultType': 'future',  # 改为合约模式
                 'fetchMarkets': {
-                    'spot': True,     # 启用现货市场
+                    'spot': False,    # 禁用现货市场
                     'margin': False,  # 明确禁用杠杆
-                    'swap': False,   # 禁用合约
-                    'future': False  # 禁用期货
+                    'swap': True,     # 启用永续合约
+                    'future': True    # 启用期货合约
                 },
                 'fetchCurrencies': False,
                 'recvWindow': 5000,  # 固定接收窗口
@@ -34,8 +35,12 @@ class ExchangeClient:
                 'warnOnFetchOpenOrdersWithoutSymbol': False,
                 'createMarketBuyOrderRequiresPrice': False
             },
-            'aiohttp_proxy': proxy,  # 使用环境变量中的代理配置
-            'verbose': settings.DEBUG_MODE
+            'proxies': {
+                'http': proxy,
+                'https': proxy
+            },
+            'aiohttp_proxy': proxy,  # 添加aiohttp代理支持
+            'verbose': settings.DEBUG_MODE if hasattr(settings, 'DEBUG_MODE') else False
         })
         if proxy:
             self.logger.info(f"使用代理: {proxy}")
@@ -220,7 +225,7 @@ class ExchangeClient:
             return self.funding_balance_cache.get('data', {})
 
     async def fetch_balance(self, params=None):
-        """[已修复] 获取现货账户余额（含缓存机制），不再合并理财余额"""
+        """[已修复] 获取合约账户余额（含缓存机制）"""
         now = time.time()
         if now - self.balance_cache['timestamp'] < self.cache_ttl:
             return self.balance_cache['data']
@@ -230,11 +235,11 @@ class ExchangeClient:
             params['timestamp'] = int(time.time() * 1000) + self.time_diff
             balance = await self.exchange.fetch_balance(params)
 
-            self.logger.debug(f"现货账户余额概要: {balance.get('total', {})}")
+            self.logger.debug(f"合约账户余额概要: {balance.get('total', {})}")
             self.balance_cache = {'timestamp': now, 'data': balance}
             return balance
         except Exception as e:
-            self.logger.error(f"获取现货余额失败: {str(e)}")
+            self.logger.error(f"获取合约余额失败: {str(e)}")
             # 出错时不抛出异常，而是返回一个空的但结构完整的余额字典
             return {'free': {}, 'used': {}, 'total': {}}
     
@@ -428,6 +433,63 @@ class ExchangeClient:
             self.logger.error(f"获取成交记录失败 for {symbol}: {str(e)}")
             # 返回空列表或根据需要处理错误
             return []
+
+    async def fetch_positions(self, symbols=None):
+        """获取合约仓位信息"""
+        try:
+            positions = await self.exchange.fetch_positions(symbols)
+            return positions
+        except Exception as e:
+            self.logger.error(f"获取仓位信息失败: {str(e)}")
+            return []
+
+    async def set_leverage(self, symbol, leverage):
+        """设置合约杠杆倍数"""
+        try:
+            result = await self.exchange.set_leverage(leverage, symbol)
+            self.logger.info(f"设置杠杆成功: {symbol} -> {leverage}x")
+            return result
+        except Exception as e:
+            self.logger.error(f"设置杠杆失败: {str(e)}")
+            raise
+
+    async def set_margin_mode(self, symbol, margin_mode='isolated'):
+        """设置保证金模式 (isolated/cross)"""
+        try:
+            result = await self.exchange.set_margin_mode(margin_mode, symbol)
+            self.logger.info(f"设置保证金模式成功: {symbol} -> {margin_mode}")
+            return result
+        except Exception as e:
+            self.logger.error(f"设置保证金模式失败: {str(e)}")
+            raise
+
+    async def create_futures_order(self, symbol, side, amount, price=None, order_type='market', 
+                                 reduce_only=False, time_in_force='GTC'):
+        """创建合约订单"""
+        try:
+            await self.sync_time()
+            params = {
+                'timestamp': int(time.time() * 1000 + self.time_diff),
+                'recvWindow': 5000
+            }
+            
+            if reduce_only:
+                params['reduceOnly'] = True
+            if time_in_force:
+                params['timeInForce'] = time_in_force
+                
+            order = await self.exchange.create_order(
+                symbol=symbol,
+                type=order_type,
+                side=side.lower(),
+                amount=amount,
+                price=price,
+                params=params
+            )
+            return order
+        except Exception as e:
+            self.logger.error(f"创建合约订单失败: {str(e)}")
+            raise
 
     async def calculate_total_account_value(self, quote_currency: str = 'USDT', min_value_threshold: float = 1.0) -> float:
         """

@@ -1,4 +1,4 @@
-# GridBNB-USDTä¾èµ–åº“ (é€‚é…Python 3.13.1)
+# GridBNB-USDTÒÀÀµ¿â (ÊÊÅäPython 3.13.1)
 aiohttp>=3.9.1
 aiofiles>=23.2.1
 ccxt>=4.1.0

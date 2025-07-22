@@ -87,46 +87,61 @@ class AdvancedRiskManager:
         risk_state = await self.check_position_limits(spot_balance, funding_balance)
         return risk_state != RiskState.ALLOW_ALL
 
-    async def _get_position_value(self, spot_balance, funding_balance):
-        # balance = await self.trader.exchange.fetch_balance() # 删除，使用参数
-        # funding_balance = await self.trader.exchange.fetch_funding_balance() # 删除，使用参数
-        if not self.trader.base_asset:
-            self.trader.logger.error("基础资产信息未初始化")
-            return 0
-        base_amount = (
-            float(spot_balance.get('free', {}).get(self.trader.base_asset, 0)) +
-            float(funding_balance.get(self.trader.base_asset, 0))
-        )
-        current_price = await self.trader._get_latest_price()
-        return base_amount * current_price
-
-    async def _get_position_ratio(self, spot_balance, funding_balance):
-        """获取当前仓位占总资产比例"""
+    async def _get_position_value(self, futures_balance, funding_balance=None):
+        """获取合约仓位价值"""
         try:
-            position_value = await self._get_position_value(spot_balance, funding_balance) # 传递参数
-            # balance = await self.trader.exchange.fetch_balance() # 删除，使用参数
-            # funding_balance = await self.trader.exchange.fetch_funding_balance() # 删除，使用参数
+            # 获取当前仓位信息
+            positions = await self.trader.exchange.fetch_positions([self.trader.symbol])
+            position_value = 0
+            
+            for position in positions:
+                if position['symbol'] == self.trader.symbol:
+                    # 使用名义价值作为仓位价值
+                    position_value = abs(float(position.get('notional', 0)))
+                    break
+            
+            return position_value
+        except Exception as e:
+            self.trader.logger.error(f"获取合约仓位价值失败: {e}")
+            return 0
 
-            quote_balance = (
-                float(spot_balance.get('free', {}).get(self.trader.quote_asset, 0)) +
-                float(funding_balance.get(self.trader.quote_asset, 0))
-            )
-
-            total_assets = position_value + quote_balance
-            if total_assets == 0:
+    async def _get_position_ratio(self, futures_balance, funding_balance=None):
+        """获取当前合约仓位占总资产比例"""
+        try:
+            position_value = await self._get_position_value(futures_balance, funding_balance)
+            
+            # 获取USDT余额（合约保证金）
+            usdt_balance = float(futures_balance.get('free', {}).get('USDT', 0) or 0)
+            usdt_used = float(futures_balance.get('used', {}).get('USDT', 0) or 0)
+            
+            # 获取未实现盈亏
+            positions = await self.trader.exchange.fetch_positions([self.trader.symbol])
+            unrealized_pnl = 0
+            for position in positions:
+                if position['symbol'] == self.trader.symbol:
+                    unrealized_pnl = float(position.get('unrealizedPnl', 0))
+                    break
+            
+            # 总资产 = 可用余额 + 已用保证金 + 未实现盈亏
+            total_assets = usdt_balance + usdt_used + unrealized_pnl
+            
+            if total_assets <= 0:
                 return 0
 
-            ratio = position_value / total_assets
+            # 仓位比例 = 仓位价值 / (总资产 * 杠杆)
+            # 这样计算可以反映实际的风险敞口
+            ratio = position_value / (total_assets * self.trader.leverage)
+            
             self.logger.debug(
-                f"仓位计算 | "
-                f"{self.trader.base_asset}价值: {position_value:.2f} {self.trader.quote_asset} | "
-                f"{self.trader.quote_asset}余额: {quote_balance:.2f} | "
-                f"总资产: {total_assets:.2f} | "
+                f"合约仓位计算 | "
+                f"仓位价值: {position_value:.2f} USDT | "
+                f"总资产: {total_assets:.2f} USDT | "
+                f"杠杆: {self.trader.leverage}x | "
                 f"仓位比例: {ratio:.2%}"
             )
             return ratio
         except Exception as e:
-            self.logger.error(f"计算仓位比例失败: {str(e)}")
+            self.logger.error(f"计算合约仓位比例失败: {str(e)}")
             return 0
 
     async def check_market_sentiment(self):
